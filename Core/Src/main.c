@@ -50,6 +50,9 @@ UART_HandleTypeDef huart2;
 volatile uint8_t ticket_button_flag = 0;
 volatile uint32_t ticket_button_tick = 0;
 uint16_t ticket_number = 0;
+uint8_t ticket_button_released = 1;
+uint32_t ticket_release_tick = 0;
+volatile uint32_t dbg_exti_count = 0;   /* 偵錯用，測完刪掉 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -113,28 +116,56 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* ===== 偵錯用，測完刪掉 ===== */
+    static uint32_t dbg_tick = 0;
+    if (HAL_GetTick() - dbg_tick >= 500U)
+    {
+      char dbg[40];
+      dbg_tick = HAL_GetTick();
+      int dbg_len = snprintf(dbg, sizeof(dbg), "PB5=%d EXTI=%lu\r\n",
+                             (int)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5),
+                             (unsigned long)dbg_exti_count);
+      HAL_UART_Transmit(&huart2, (uint8_t *)dbg, (uint16_t)dbg_len, 100);
+    }
+    /* ===== 偵錯結束 ===== */
+    if (ticket_button_flag && (HAL_GetTick() - ticket_button_tick) >= 50U)
+    {
+      ticket_button_flag = 0;
 
-	  if (ticket_button_flag && (HAL_GetTick() - ticket_button_tick) >= 20U)
-	  {
-	    ticket_button_flag = 0;
+      if (ticket_button_released &&
+          HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5) == GPIO_PIN_RESET)
+      {
+        char ticket_msg[8];
 
-	    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_9) == GPIO_PIN_RESET)
-	    {
-	      char ticket_msg[8];
+        ticket_button_released = 0;
+        ticket_release_tick = HAL_GetTick();
 
-	      ticket_number++;
-	      if (ticket_number > 999U)
-	      {
-	        ticket_number = 1;
-	      }
+        ticket_number++;
+        if (ticket_number > 999U)
+        {
+          ticket_number = 1;
+        }
 
-	      int ticket_len = snprintf(ticket_msg, sizeof(ticket_msg), "%03u\r\n", ticket_number);
-	      HAL_UART_Transmit(&huart2, (const uint8_t *)ticket_msg, (uint16_t)ticket_len, 100);
-	    }
-	  }
+        int ticket_len = snprintf(ticket_msg, sizeof(ticket_msg), "%03u\r\n", ticket_number);
+        HAL_UART_Transmit(&huart2, (const uint8_t *)ticket_msg, (uint16_t)ticket_len, 100);
+      }
+    }
+
+    if (!ticket_button_released)
+    {
+      if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5) == GPIO_PIN_RESET)
+      {
+        ticket_release_tick = HAL_GetTick();
+      }
+      else if ((HAL_GetTick() - ticket_release_tick) >= 50U)
+      {
+        ticket_button_released = 1;
+      }
+    }
+  }
   /* USER CODE END 3 */
 }
-}
+
 /**
   * @brief System Clock Configuration
   * @retval None
@@ -456,7 +487,8 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-  if (GPIO_Pin == GPIO_PIN_9)
+  dbg_exti_count++;   /* 偵錯用，測完刪掉 */
+  if (GPIO_Pin == GPIO_PIN_5)
   {
     ticket_button_tick = HAL_GetTick();
     ticket_button_flag = 1;
