@@ -100,7 +100,8 @@ int main(void)
   MX_TIM6_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-
+  const char boot_msg[] = "QUEUE READY\r\n";
+  HAL_UART_Transmit(&huart2, (const uint8_t *)boot_msg, sizeof(boot_msg) - 1, 100);
   /* USER CODE END 2 */
 
   /* Infinite loop */
