@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,7 +32,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define UART_RX_BUFFER_SIZE 64U
+#define QUEUE_SIZE          16U
+#define CMD_SIZE            32U
+#define CALL_TIMEOUT_MS     10000U
+#define LED_MAX_CCR         1000U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -52,7 +57,30 @@ volatile uint32_t ticket_button_tick = 0;
 uint16_t ticket_number = 0;
 uint8_t ticket_button_released = 1;
 uint32_t ticket_release_tick = 0;
-volatile uint32_t dbg_exti_count = 0;   /* 偵錯用，測完刪掉 */
+uint8_t uart_rx_byte;
+volatile uint8_t uart_rx_buffer[UART_RX_BUFFER_SIZE];
+volatile uint16_t uart_rx_head = 0;
+volatile uint16_t uart_rx_tail = 0;
+
+/* 排隊用環形緩衝 */
+uint16_t queue_buf[QUEUE_SIZE];
+uint8_t queue_head = 0;
+uint8_t queue_tail = 0;
+uint8_t queue_count = 0;
+
+/* 指令列 */
+char cmd_line[CMD_SIZE];
+uint8_t cmd_len = 0;
+
+/* 叫號狀態 */
+uint16_t called_ticket = 0;
+uint32_t called_tick = 0;
+uint8_t checked_in = 0;
+
+/* 緊急暫停（B1） */
+volatile uint8_t emergency_flag = 0;
+volatile uint32_t emergency_tick = 0;
+uint8_t emergency_active = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -63,6 +91,10 @@ static void MX_TIM3_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
+void UART_Print(const char *text);
+void Take_Ticket(void);
+void Call_Next(void);
+void Command_Handle(const char *line);
 
 /* USER CODE END PFP */
 
@@ -107,6 +139,9 @@ int main(void)
   /* USER CODE BEGIN 2 */
   const char boot_msg[] = "QUEUE READY\r\n";
   HAL_UART_Transmit(&huart2, (const uint8_t *)boot_msg, sizeof(boot_msg) - 1, 100);
+  HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);   /* 黃燈 PC7 */
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);   /* 綠燈 PC8 */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -116,18 +151,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* ===== 偵錯用，測完刪掉 ===== */
-    static uint32_t dbg_tick = 0;
-    if (HAL_GetTick() - dbg_tick >= 500U)
-    {
-      char dbg[40];
-      dbg_tick = HAL_GetTick();
-      int dbg_len = snprintf(dbg, sizeof(dbg), "PB5=%d EXTI=%lu\r\n",
-                             (int)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5),
-                             (unsigned long)dbg_exti_count);
-      HAL_UART_Transmit(&huart2, (uint8_t *)dbg, (uint16_t)dbg_len, 100);
-    }
-    /* ===== 偵錯結束 ===== */
     if (ticket_button_flag && (HAL_GetTick() - ticket_button_tick) >= 50U)
     {
       ticket_button_flag = 0;
@@ -135,19 +158,10 @@ int main(void)
       if (ticket_button_released &&
           HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5) == GPIO_PIN_RESET)
       {
-        char ticket_msg[8];
-
         ticket_button_released = 0;
         ticket_release_tick = HAL_GetTick();
 
-        ticket_number++;
-        if (ticket_number > 999U)
-        {
-          ticket_number = 1;
-        }
-
-        int ticket_len = snprintf(ticket_msg, sizeof(ticket_msg), "%03u\r\n", ticket_number);
-        HAL_UART_Transmit(&huart2, (const uint8_t *)ticket_msg, (uint16_t)ticket_len, 100);
+        Take_Ticket();
       }
     }
 
@@ -161,6 +175,90 @@ int main(void)
       {
         ticket_button_released = 1;
       }
+    }
+
+    /* UART：一次取一個字，收到 Enter 才判斷整行指令 */
+    while (uart_rx_tail != uart_rx_head)
+    {
+      uint8_t rx_char = uart_rx_buffer[uart_rx_tail];
+      uart_rx_tail = (uart_rx_tail + 1U) % UART_RX_BUFFER_SIZE;
+
+      if ((rx_char == '\r') || (rx_char == '\n'))
+      {
+        if (cmd_len > 0U)
+        {
+          UART_Print("\r\n");
+          cmd_line[cmd_len] = '\0';
+          Command_Handle(cmd_line);
+          cmd_len = 0;
+        }
+      }
+      else
+      {
+        HAL_UART_Transmit(&huart2, &rx_char, 1, 100);   /* 回顯 */
+        if (cmd_len < (CMD_SIZE - 1U))
+        {
+          cmd_line[cmd_len] = (char)rx_char;
+          cmd_len++;
+        }
+      }
+    }
+
+    /* 緊急按鈕 B1：去彈跳 50 ms，且確認仍按著才切換 */
+    if (emergency_flag && (HAL_GetTick() - emergency_tick) >= 50U)
+    {
+      emergency_flag = 0;
+
+      if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET)
+      {
+        emergency_active = !emergency_active;
+        UART_Print(emergency_active ? "緊急暫停\r\n" : "恢復正常\r\n");
+
+        if (!emergency_active && (called_ticket != 0U))
+        {
+          called_tick = HAL_GetTick();   /* 恢復後重新計時 */
+        }
+      }
+    }
+
+    /* 叫號後 10 秒沒報到就過號（暫停時不計） */
+    if (!emergency_active && (called_ticket != 0U) && !checked_in &&
+        (HAL_GetTick() - called_tick) >= CALL_TIMEOUT_MS)
+    {
+      char msg[24];
+      snprintf(msg, sizeof(msg), "%03u 過號\r\n", called_ticket);
+      UART_Print(msg);
+      called_ticket = 0;
+      Call_Next();
+    }
+
+    /* 燈號：黃燈依人數、綠燈等待時呼吸／報到恆亮、紅燈緊急 */
+    {
+      uint32_t yellow = (uint32_t)queue_count * LED_MAX_CCR / QUEUE_SIZE;
+      uint32_t green = 0;
+
+      if (called_ticket != 0U)
+      {
+        if (checked_in)
+        {
+          green = LED_MAX_CCR;
+        }
+        else
+        {
+          uint32_t phase = HAL_GetTick() % 2000U;
+          green = (phase < 1000U) ? phase : (2000U - phase);
+        }
+      }
+
+      if (emergency_active)
+      {
+        yellow = 0;
+        green = 0;
+      }
+
+      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, yellow);
+      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, green);
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, emergency_active ? GPIO_PIN_SET : GPIO_PIN_RESET);
     }
   }
   /* USER CODE END 3 */
@@ -341,7 +439,14 @@ static void MX_TIM3_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN TIM3_Init 2 */
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
 
+  GPIO_InitStruct.Pin = GPIO_PIN_7 | GPIO_PIN_8;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
   /* USER CODE END TIM3_Init 2 */
 
 }
@@ -487,11 +592,147 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-  dbg_exti_count++;   /* 偵錯用，測完刪掉 */
   if (GPIO_Pin == GPIO_PIN_5)
   {
     ticket_button_tick = HAL_GetTick();
     ticket_button_flag = 1;
+  }
+  else if (GPIO_Pin == GPIO_PIN_13)
+  {
+    emergency_tick = HAL_GetTick();
+    emergency_flag = 1;
+  }
+}
+
+void UART_Print(const char *text)
+{
+  HAL_UART_Transmit(&huart2, (const uint8_t *)text, (uint16_t)strlen(text), 100);
+}
+
+/* 抽號：按鈕或 take 指令都走這裡 */
+void Take_Ticket(void)
+{
+  char msg[24];
+
+  if (queue_count >= QUEUE_SIZE)
+  {
+    UART_Print("客滿\r\n");
+    return;
+  }
+
+  ticket_number++;
+  if (ticket_number > 999U)
+  {
+    ticket_number = 1;
+  }
+
+  queue_buf[queue_head] = ticket_number;
+  queue_head = (queue_head + 1U) % QUEUE_SIZE;
+  queue_count++;
+
+  snprintf(msg, sizeof(msg), "%03u\r\n", ticket_number);
+  UART_Print(msg);
+}
+
+/* 叫號：從 tail 取出最前面的人 */
+void Call_Next(void)
+{
+  char msg[32];
+
+  if (queue_count == 0U)
+  {
+    called_ticket = 0;
+    UART_Print("目前沒有人排隊\r\n");
+    return;
+  }
+
+  called_ticket = queue_buf[queue_tail];
+  queue_tail = (queue_tail + 1U) % QUEUE_SIZE;
+  queue_count--;
+  called_tick = HAL_GetTick();
+  checked_in = 0;
+
+  snprintf(msg, sizeof(msg), "請 %03u 到櫃台\r\n", called_ticket);
+  UART_Print(msg);
+}
+
+void Command_Handle(const char *line)
+{
+  if (strcmp(line, "take") == 0)
+  {
+    Take_Ticket();
+  }
+  else if (strcmp(line, "next") == 0)
+  {
+    if (emergency_active)
+    {
+      return;   /* 緊急暫停時 next 沒反應 */
+    }
+
+    if ((called_ticket != 0U) && !checked_in)
+    {
+      UART_Print("請等待目前號碼報到或過號\r\n");
+      return;
+    }
+
+    Call_Next();
+  }
+  else if (strcmp(line, "ok") == 0)
+  {
+    char msg[24];
+    if ((called_ticket != 0U) && !checked_in)
+    {
+      checked_in = 1;
+      snprintf(msg, sizeof(msg), "%03u 報到\r\n", called_ticket);
+      UART_Print(msg);
+    }
+    else
+    {
+      UART_Print("目前沒有等待報到的號碼\r\n");
+    }
+  }
+  else if (strcmp(line, "list") == 0)
+  {
+    char msg[8];
+    uint8_t idx = queue_tail;
+
+    if (queue_count == 0U)
+    {
+      UART_Print("目前沒有人排隊\r\n");
+      return;
+    }
+    UART_Print("排隊中：");
+    for (uint8_t i = 0; i < queue_count; i++)
+    {
+      snprintf(msg, sizeof(msg), "%03u ", queue_buf[idx]);
+      UART_Print(msg);
+      idx = (idx + 1U) % QUEUE_SIZE;
+    }
+    UART_Print("\r\n");
+  }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    uint16_t next_head = (uart_rx_head + 1U) % UART_RX_BUFFER_SIZE;
+
+    if (next_head != uart_rx_tail)
+    {
+      uart_rx_buffer[uart_rx_head] = uart_rx_byte;
+      uart_rx_head = next_head;
+    }
+
+    HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
   }
 }
 /* USER CODE END 4 */
